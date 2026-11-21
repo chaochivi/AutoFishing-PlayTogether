@@ -81,8 +81,9 @@ class TestClassification:
         both = classify_repair_ui(ui(d(C.TOOL_TAB), d(C.REPAIR_BUTTON, 0.9)))
         assert both.state is RepairDialog.UNKNOWN and not both.clickable
 
-    def test_low_confidence_repair_with_tab_navigates_tab(self):
-        assert classify_repair_ui(ui(d(C.TOOL_TAB), d(C.REPAIR_BUTTON, 0.4))).state is RepairDialog.TAB
+    def test_repair_button_with_tab_is_unknown_not_clickable(self):
+        r = classify_repair_ui(ui(d(C.TOOL_TAB), d(C.REPAIR_BUTTON, 0.4)))
+        assert r.state is RepairDialog.UNKNOWN and not r.clickable
 
     def test_unrelated_classes_are_unknown(self):
         assert classify_repair_ui(ui(d(C.STORE_BUTTON), d(C.TOOL_BROKEN))).state is RepairDialog.UNKNOWN
