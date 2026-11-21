@@ -132,19 +132,22 @@ def classify_repair_ui(ui: dict, min_conf: float = DEFAULT_MIN_CONFIDENCE) -> Re
         return RepairDecision(RepairDialog.UNKNOWN, None,
                               f"repair-done below confidence {min_conf:.2f} ({done.conf:.2f})", True)
 
-    # 3. Free repair: requires the repair button at sufficient confidence.
+    # 3. A generic repair button is NOT proof that repair is free.
+    # The detector must gain a dedicated, positively trained FREE_REPAIR class
+    # (or equivalent independent evidence) before automated repair can be enabled.
     rep = ui.get(C.REPAIR_BUTTON)
-    if rep is not None and rep.conf >= min_conf:
-        return RepairDecision(RepairDialog.FREE, rep, f"free-repair evidence ({rep.conf:.2f})")
+    if rep is not None:
+        return RepairDecision(
+            RepairDialog.UNKNOWN, None,
+            "generic repair-button is not proof of free repair; refusing to click", True
+        )
 
-    # 4. Navigation to the tools tab (harmless, not a confirmation).
+    # 4. Navigation to the tools tab is harmless only when no repair control
+    # is simultaneously visible.
     tab = ui.get(C.TOOL_TAB)
     if tab is not None:
         return RepairDecision(RepairDialog.TAB, tab, "tools tab visible")
 
-    if rep is not None:
-        return RepairDecision(RepairDialog.UNKNOWN, None,
-                              f"repair-button below confidence {min_conf:.2f} ({rep.conf:.2f})", True)
     return RepairDecision(RepairDialog.UNKNOWN, None, "no recognised repair dialog")
 
 
