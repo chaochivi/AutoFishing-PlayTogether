@@ -29,13 +29,15 @@ def ui(*dets):
 
 # ---------------------------------------------------------------- classification
 class TestClassification:
-    def test_free_repair_needs_confident_repair_button(self):
-        r = classify_repair_ui(ui(d(C.REPAIR_BUTTON, 0.9)))
-        assert r.state is RepairDialog.FREE and r.clickable
-        assert r.intent is ClickIntent.FREE_REPAIR
+    def test_generic_repair_button_is_never_proof_of_free_repair(self):
+        r = classify_repair_ui(ui(d(C.REPAIR_BUTTON, 0.99)))
+        assert r.state is RepairDialog.UNKNOWN
+        assert not r.clickable and r.ambiguous
+        assert r.intent is ClickIntent.UNKNOWN_DIALOG
 
-    def test_repair_button_exactly_at_threshold_is_accepted(self):
-        assert classify_repair_ui(ui(d(C.REPAIR_BUTTON, 0.50)), 0.50).state is RepairDialog.FREE
+    def test_generic_repair_button_at_threshold_is_still_unknown(self):
+        r = classify_repair_ui(ui(d(C.REPAIR_BUTTON, 0.50)), 0.50)
+        assert r.state is RepairDialog.UNKNOWN and not r.clickable
 
     def test_low_confidence_repair_button_is_unknown_and_ambiguous(self):
         r = classify_repair_ui(ui(d(C.REPAIR_BUTTON, 0.40)), 0.50)
@@ -77,10 +79,11 @@ class TestClassification:
     def test_tab_only_when_no_repair_evidence(self):
         assert classify_repair_ui(ui(d(C.TOOL_TAB))).state is RepairDialog.TAB
         both = classify_repair_ui(ui(d(C.TOOL_TAB), d(C.REPAIR_BUTTON, 0.9)))
-        assert both.state is RepairDialog.FREE
+        assert both.state is RepairDialog.UNKNOWN and not both.clickable
 
-    def test_low_confidence_repair_with_tab_navigates_tab(self):
-        assert classify_repair_ui(ui(d(C.TOOL_TAB), d(C.REPAIR_BUTTON, 0.4))).state is RepairDialog.TAB
+    def test_repair_button_with_tab_is_unknown_not_clickable(self):
+        r = classify_repair_ui(ui(d(C.TOOL_TAB), d(C.REPAIR_BUTTON, 0.4)))
+        assert r.state is RepairDialog.UNKNOWN and not r.clickable
 
     def test_unrelated_classes_are_unknown(self):
         assert classify_repair_ui(ui(d(C.STORE_BUTTON), d(C.TOOL_BROKEN))).state is RepairDialog.UNKNOWN
