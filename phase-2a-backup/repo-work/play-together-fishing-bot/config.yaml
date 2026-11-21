@@ -1,0 +1,107 @@
+# ---------------------------------------------------------------------------
+# Play Together Auto-Fishing  -  config.yaml
+# All coordinates are in "logical window pixels" (capture.image_width x
+# capture.image_height). Recalibrate with:  python main.py --pick
+# ---------------------------------------------------------------------------
+
+# window  -> capture the emulator window (MSS)     [BlueStacks / LDPlayer / Steam]
+# screen  -> capture the whole primary monitor
+# adb     -> capture via `adb exec-out screencap` and tap via `adb shell input`
+backend: window
+
+# Part of the emulator/game window title. Leave empty to use the whole screen.
+window_title: "BlueStacks"
+
+# detector: auto | yolo | template
+#   auto     = YOLO if models/best.pt exists, otherwise OpenCV templates/HSV
+detector: auto
+
+# pyautogui | pydirectinput
+input_backend: pyautogui
+
+# Global hotkeys (Windows):  F8 = pause/resume   F10 = stop
+hotkeys:
+  pause_vk: 0x77
+  stop_vk: 0x79
+
+capture:
+  image_width: 1600
+  image_height: 900
+
+  # Bite-detection region (where the "!" appears above the character)
+  top: 50
+  left: 850
+  width: 500
+  height: 400
+
+model:
+  path: "models/best.pt"
+  confidence: 0.40
+  imgsz: 256
+  bite_classes:
+    - "exclamation-mark"
+
+# Used when detector = template (or no model found)
+template:
+  folder: "templates"      # put exclamation-mark.png, store-button.png ... here
+  threshold: 0.80
+  hsv_bang_min_area: 40    # fallback "!" finder (red/orange blob) when no template
+  hsv_bang_max_area: 6000
+
+bot:
+  poll_interval_ms: 0
+  click_delay_ms: 0
+  cast_delay_ms: 400
+
+  after_catch_min_ms: 300
+  after_catch_timeout_ms: 12000
+
+  cooldown_after_bite_ms: 1200
+  min_wait_before_bite_ms: 0
+  bite_timeout_ms: 60000   # recast if nothing bites for this long
+  hold_ms: 300             # used by *_mode: hold
+
+# --- Repair ---------------------------------------------------------------
+# SAFETY: paid repairs are NEVER confirmed automatically, whatever this is set to.
+# Kept false; if a paid repair dialog appears the bot stops so you can handle it manually.
+allow_paid_repair: false
+repair_timeout_ms: 25000
+repair_click_gap_ms: 700
+# A free-repair click needs the repair button at >= this confidence on N consecutive frames.
+repair_min_confidence: 0.50
+repair_confirm_frames: 2        # minimum 2 (enforced in code)
+repair_confirm_interval_ms: 150
+
+bag_x: 1537
+bag_y: 500
+rod_x: 0        # first rod slot in the Tools tab (0 = skip, game auto-selects)
+rod_y: 0
+close_x: 0      # close-backpack button (0 = skip)
+close_y: 0
+
+# --- UI detection ---------------------------------------------------------
+ui_imgsz: 416
+ui_confidence: 0.35
+
+auto_cast: true
+
+# tap | hold | key
+cast_mode: tap
+jerk_mode: tap
+store_mode: tap
+
+action_mode: tap
+action_key: space
+
+cast_x: 1268
+cast_y: 541
+
+reel_x: 1405
+reel_y: 695
+
+store_x: 1153
+store_y: 600
+
+# --- ADB backend only -----------------------------------------------------
+adb_path: "adb"
+adb_serial: ""   # e.g. 127.0.0.1:5555 (BlueStacks) / emulator-5554 (LDPlayer)

@@ -1,0 +1,1398 @@
+diff --git a/README.md b/README.md
+index df93487..d8629ab 100644
+--- a/README.md
++++ b/README.md
+@@ -320,7 +320,7 @@ bot:
+ 
+ Repair Settings
+ yaml
+-allow_paid_repair: true
++allow_paid_repair: false   # paid repairs are never auto-confirmed (see below)
+ 
+ repair_timeout_ms: 25000
+ repair_click_gap_ms: 700
+@@ -329,7 +329,18 @@ bag_x: 1537
+ bag_y: 500
+ 
+ 
+-Set allow_paid_repair to false if you do not want the bot to use paid repairs.
++repair_min_confidence: 0.50
++repair_confirm_frames: 2
++repair_confirm_interval_ms: 150
++
++Paid-repair safety
++
++The bot never confirms a paid repair automatically. allow_paid_repair defaults to false and, even if set to true, it does not enable paid-repair confirmation (the bot logs a warning and ignores it).
++If a paid-repair dialog is detected the bot stops without clicking so you can handle it manually in-game.
++Dialogs the bot cannot positively identify (nothing recognised, low-confidence or conflicting detections) are never clicked.
++A free repair is only automated when the repair button is detected at repair_min_confidence or higher on repair_confirm_frames consecutive fresh frames (minimum 2), with no paid-repair evidence.
++The same restrictions are enforced independently in the input layer (DesktopInput and AdbInput).
++Run the tests with: pip install pytest PyYAML && python -m pytest tests
+ 
+ UI Detection Settings
+ yaml
+@@ -615,7 +626,7 @@ Rod Does Not Repair Automatically
+ Verify backpack coordinates.
+ Check repair button detection.
+ Verify the inventory layout.
+-Check allow_paid_repair.
++If the bot stopped with a paid-repair message, repair the rod manually (paid repairs are never automated).
+ Increase repair_timeout_ms if necessary.
+ High Detection Latency
+ Prefer MSS window capture over ADB.
+diff --git a/play-together-fishing-bot/autofishing/bot/fishing_bot.py b/play-together-fishing-bot/autofishing/bot/fishing_bot.py
+index c2b6e28..98fae8c 100644
+--- a/play-together-fishing-bot/autofishing/bot/fishing_bot.py
++++ b/play-together-fishing-bot/autofishing/bot/fishing_bot.py
+@@ -7,6 +7,16 @@ from dataclasses import dataclass, field
+ from enum import Enum, auto
+ 
+ from .. import constants as C
++from ..safety import (
++    DEFAULT_CONFIRM_FRAMES,
++    DEFAULT_MIN_CONFIDENCE,
++    MIN_CONFIRM_FRAMES,
++    ClickIntent,
++    RepairDecision,
++    RepairDialog,
++    classify_repair_ui,
++    same_evidence,
++)
+ 
+ 
+ class State(Enum):
+@@ -40,6 +50,9 @@ class FishingBot:
+         self.bite_classes = set(cfg["model"]["bite_classes"])
+         c = cfg["capture"]
+         self.roi = (int(c["left"]), int(c["top"]), int(c["width"]), int(c["height"]))
++        if cfg.get("allow_paid_repair"):
++            self.log("WARNING: allow_paid_repair is set but IGNORED - paid repairs are never "
++                     "confirmed automatically. The bot will stop if a paid repair is required.")
+ 
+     # ------------------------------------------------------------------ utils
+     def log(self, msg: str) -> None:
+@@ -54,14 +67,14 @@ class FishingBot:
+             time.sleep(min(0.05, max(0, end - time.time())))
+         return self.keys.alive()
+ 
+-    def act(self, x: float, y: float, mode: str) -> None:
+-        self.inp.act(x, y, mode)
++    def act(self, x: float, y: float, mode: str, intent: ClickIntent = ClickIntent.GENERIC) -> None:
++        self.inp.act(x, y, mode, intent=intent)
+         if self.b["click_delay_ms"]:
+             time.sleep(self.b["click_delay_ms"] / 1000)
+ 
+-    def click_det(self, det) -> None:
++    def click_det(self, det, intent: ClickIntent = ClickIntent.GENERIC) -> None:
+         cx, cy = det.center
+-        self.inp.click(cx, cy)
++        self.inp.click(cx, cy, intent=intent, target=det.name)
+ 
+     def roi_crop(self, frame):
+         l, t, w, h = self.roi
+@@ -164,61 +177,128 @@ class FishingBot:
+         self.log("After-catch timeout")
+         return State.COOLDOWN
+ 
++    # ----------------------------------------------------------------- repair
++    def _input_is_guarded(self) -> bool:
++        return all(callable(getattr(self.inp, n, None)) for n in ("begin_repair_session", "end_repair_session"))
++
+     def s_repair(self) -> State:
++        """Free-repair flow. Paid / unknown / ambiguous dialogs are NEVER clicked.
++
++        The input backend is put into a "repair session" in which it independently
++        refuses paid confirmations, unlabeled clicks and confirm-type keypresses.
++        """
++        if not self._input_is_guarded():
++            self.log("REPAIR refused: input backend does not enforce repair safety -> stopping bot")
++            self.keys.stop()
++            return State.COOLDOWN
++        self.inp.begin_repair_session()
++        try:
++            return self._repair_flow()
++        finally:
++            self.inp.end_repair_session()
++
++    def _confirm_decision(self, first: RepairDecision, min_conf: float):
++        """Require the same clickable evidence on several consecutive fresh frames.
++
++        The last frame is grabbed immediately before the click, so a dialog that
++        changed in between (e.g. free -> paid) is caught. Returns the confirmed
++        decision, a PAID decision if one appeared, or None if evidence disagreed.
++        """
++        frames = max(MIN_CONFIRM_FRAMES, int(self.cfg.get("repair_confirm_frames", DEFAULT_CONFIRM_FRAMES)))
++        interval = self.cfg.get("repair_confirm_interval_ms", 150)
++        cur = first
++        for _ in range(frames - 1):
++            if not self.sleep(interval):
++                return None
++            nxt = classify_repair_ui(self.ui(self.cap.grab(), C.REPAIR_CLASSES), min_conf)
++            if nxt.state is RepairDialog.PAID:
++                return nxt
++            if not same_evidence(cur, nxt):
++                return None
++            cur = nxt
++        return cur
++
++    def _abort_paid_repair(self, dec: RepairDecision) -> State:
++        # Deliberately no blind taps here: a paid dialog may be on screen.
++        self.log(f"Paid repair detected ({dec.reason}) -> NOT confirming; stopping bot. "
++                 "Handle the repair manually in-game.")
++        self.keys.stop()
++        return State.COOLDOWN
++
++    def _repair_flow(self) -> State:
+         gap = self.cfg["repair_click_gap_ms"]
++        min_conf = float(self.cfg.get("repair_min_confidence", DEFAULT_MIN_CONFIDENCE))
+         deadline = time.time() + self.cfg["repair_timeout_ms"] / 1000
+         self.log("REPAIR: opening backpack")
+-        self.act(self.cfg["bag_x"], self.cfg["bag_y"], "tap")
++        self.act(self.cfg["bag_x"], self.cfg["bag_y"], "tap", intent=ClickIntent.NAVIGATION)
+         if not self.sleep(gap):
+             return State.COOLDOWN
+         tab_clicks = 0
+-        idle = 0
++        ambiguous_seen = False
++        last_reason = ""
+         while self.keys.alive() and time.time() < deadline:
+-            ui = self.ui(self.cap.grab(), C.REPAIR_CLASSES)
++            dec = classify_repair_ui(self.ui(self.cap.grab(), C.REPAIR_CLASSES), min_conf)
+ 
+-            if C.REPAIR_DONE_BUTTON in ui or C.REPAIR_DONE_TEXT in ui:
+-                self.click_det(ui.get(C.REPAIR_DONE_BUTTON) or ui[C.REPAIR_DONE_TEXT])
++            if dec.state is RepairDialog.PAID:
++                return self._abort_paid_repair(dec)
++
++            if dec.state is RepairDialog.TAB and tab_clicks >= 3:
++                dec = RepairDecision(RepairDialog.UNKNOWN, None, "tools tab did not open the rod list")
++
++            if dec.state is RepairDialog.UNKNOWN:
++                # Never click anything on an unrecognised / ambiguous screen. Wait for it to resolve.
++                if dec.ambiguous:
++                    ambiguous_seen = True
++                if dec.reason != last_reason:
++                    self.log(f"Repair dialog not actionable ({dec.reason}) -> not clicking")
++                    last_reason = dec.reason
++                if not self.sleep(gap):
++                    break
++                continue
++            last_reason = ""
++
++            if dec.state in (RepairDialog.FREE, RepairDialog.DONE):
++                dec = self._confirm_decision(dec, min_conf)
++                if dec is None:  # evidence flickered -> treat as ambiguous, re-evaluate
++                    ambiguous_seen = True
++                    if not self.sleep(gap):
++                        break
++                    continue
++                if dec.state is RepairDialog.PAID:
++                    return self._abort_paid_repair(dec)
++
++            if dec.state is RepairDialog.DONE:
++                self.click_det(dec.target, dec.intent)
+                 self.stats.repairs += 1
+                 self.log("Rod repaired | " + self.stats.line())
+                 self.sleep(gap)
+                 self._close_bag()
+                 return State.COOLDOWN
+ 
+-            if C.PAID_REPAIR_BUTTON in ui or C.PAID_REPAIR_TEXT in ui:
+-                if not self.cfg["allow_paid_repair"]:
+-                    self.log("Paid repair required but allow_paid_repair=false -> stopping bot")
+-                    self._close_bag()
+-                    self.keys.stop()
+-                    return State.COOLDOWN
+-                if C.PAID_REPAIR_BUTTON in ui:
+-                    self.log("Confirming paid repair")
+-                    self.click_det(ui[C.PAID_REPAIR_BUTTON])
+-                    idle = 0
+-            elif C.REPAIR_BUTTON in ui:
+-                self.log("Clicking repair")
+-                self.click_det(ui[C.REPAIR_BUTTON])
+-                idle = 0
+-            elif C.TOOL_TAB in ui and tab_clicks < 3:
++            if dec.state is RepairDialog.FREE:
++                self.log("Clicking free repair")
++                self.click_det(dec.target, dec.intent)
++            elif dec.state is RepairDialog.TAB:
+                 self.log("Opening tools tab")
+-                self.click_det(ui[C.TOOL_TAB])
++                self.click_det(dec.target, dec.intent)
+                 tab_clicks += 1
+                 self.sleep(gap)
+                 if self.cfg["rod_x"] and self.cfg["rod_y"]:
+-                    self.act(self.cfg["rod_x"], self.cfg["rod_y"], "tap")
+-                idle = 0
+-            else:
+-                idle += 1
+-                if idle % 6 == 0:  # backpack probably didn't open
+-                    self.act(self.cfg["bag_x"], self.cfg["bag_y"], "tap")
++                    self.act(self.cfg["rod_x"], self.cfg["rod_y"], "tap", intent=ClickIntent.NAVIGATION)
+             if not self.sleep(gap):
+                 break
++
++        if ambiguous_seen and self.keys.alive():
++            self.log("Repair timed out on an ambiguous dialog -> stopping bot without clicking")
++            self.keys.stop()
++            return State.COOLDOWN
+         self.log("Repair timed out")
+         self._close_bag()
+         return State.COOLDOWN
+ 
+     def _close_bag(self) -> None:
+         if self.cfg["close_x"] and self.cfg["close_y"]:
+-            self.act(self.cfg["close_x"], self.cfg["close_y"], "tap")
++            self.act(self.cfg["close_x"], self.cfg["close_y"], "tap", intent=ClickIntent.NAVIGATION)
+ 
+     def s_cooldown(self) -> State:
+         self.sleep(self.b["cooldown_after_bite_ms"])
+diff --git a/play-together-fishing-bot/autofishing/config.py b/play-together-fishing-bot/autofishing/config.py
+index 3cf60d4..cf6ab75 100644
+--- a/play-together-fishing-bot/autofishing/config.py
++++ b/play-together-fishing-bot/autofishing/config.py
+@@ -3,6 +3,7 @@ from __future__ import annotations
+ 
+ import copy
+ import os
++import sys
+ from typing import Any
+ 
+ import yaml
+@@ -44,9 +45,16 @@ DEFAULTS: dict[str, Any] = {
+         "bite_timeout_ms": 60000,
+         "hold_ms": 300,
+     },
+-    "allow_paid_repair": True,
++    # SAFETY: paid repairs are never confirmed automatically. This flag is kept for
++    # backwards compatibility only; setting it to true does NOT enable paid repair.
++    "allow_paid_repair": False,
+     "repair_timeout_ms": 25000,
+     "repair_click_gap_ms": 700,
++    # Free-repair evidence: minimum detector confidence, and number of consecutive
++    # fresh frames (minimum 2) that must agree before a repair click is automated.
++    "repair_min_confidence": 0.50,
++    "repair_confirm_frames": 2,
++    "repair_confirm_interval_ms": 150,
+     "bag_x": 1537,
+     "bag_y": 500,
+     "rod_x": 0,
+@@ -90,7 +98,12 @@ def _read_raw(path: str) -> dict:
+ 
+ 
+ def load_config(path: str = "config.yaml") -> dict:
+-    return _merge(DEFAULTS, _read_raw(path))
++    cfg = _merge(DEFAULTS, _read_raw(path))
++    if cfg.get("allow_paid_repair"):
++        print("[config] WARNING: allow_paid_repair is true but has NO effect - paid repairs are "
++              "never confirmed automatically. The bot stops when a paid repair is required.",
++              file=sys.stderr)
++    return cfg
+ 
+ 
+ def save_values(updates: dict, path: str = "config.yaml") -> None:
+diff --git a/play-together-fishing-bot/autofishing/input/controller.py b/play-together-fishing-bot/autofishing/input/controller.py
+index 6c7b9d6..8c1cd1b 100644
+--- a/play-together-fishing-bot/autofishing/input/controller.py
++++ b/play-together-fishing-bot/autofishing/input/controller.py
+@@ -1,13 +1,21 @@
+-"""Mouse / keyboard output: PyAutoGUI, PyDirectInput or ADB."""
++"""Mouse / keyboard output: PyAutoGUI, PyDirectInput or ADB.
++
++Both backends share ``RepairGuardMixin`` (see ``autofishing/safety.py``), so the
++paid-repair restrictions are enforced identically on desktop and ADB, and
++independently of the bot logic and of ``allow_paid_repair``.
++"""
+ from __future__ import annotations
+ 
+ import subprocess
+ import time
++from typing import Optional
++
++from ..safety import ClickIntent, RepairGuardMixin
+ 
+ ADB_KEYCODES = {"space": 62, "enter": 66, "esc": 111, "escape": 111, "back": 4}
+ 
+ 
+-class DesktopInput:
++class DesktopInput(RepairGuardMixin):
+     def __init__(self, cfg: dict, cap):
+         self.cfg = cfg
+         self.cap = cap
+@@ -22,7 +30,9 @@ class DesktopInput:
+             d.FAILSAFE = True  # slam mouse to a screen corner to abort
+         self.d = d
+ 
+-    def click(self, x: float, y: float, hold_ms: int = 40) -> None:
++    def click(self, x: float, y: float, hold_ms: int = 40, *,
++              intent: ClickIntent = ClickIntent.GENERIC, target: Optional[str] = None) -> None:
++        self._guard_click(intent, target)  # raises PaidRepairBlocked before any OS input
+         sx, sy = self.cap.to_screen(x, y)
+         self.d.moveTo(sx, sy)
+         time.sleep(0.03)
+@@ -31,24 +41,26 @@ class DesktopInput:
+         self.d.mouseUp()
+ 
+     def key(self, key: str, hold_ms: int = 50) -> None:
++        self._guard_key(key)
+         self.d.keyDown(key)
+         time.sleep(hold_ms / 1000)
+         self.d.keyUp(key)
+ 
+-    def act(self, x: float, y: float, mode: str) -> None:
++    def act(self, x: float, y: float, mode: str, *, intent: ClickIntent = ClickIntent.GENERIC) -> None:
++        self._guard_click(intent, None)
+         hold = int(self.cfg["bot"].get("hold_ms", 300))
+         if mode == "key":
+             self.key(self.cfg.get("action_key", "space"))
+         elif mode == "hold":
+-            self.click(x, y, hold_ms=hold)
++            self.click(x, y, hold_ms=hold, intent=intent)
+         else:
+-            self.click(x, y)
++            self.click(x, y, intent=intent)
+ 
+     def escape(self) -> None:
+         self.key("esc")
+ 
+ 
+-class AdbInput:
++class AdbInput(RepairGuardMixin):
+     def __init__(self, cfg: dict, cap):
+         self.cfg = cfg
+         self.cap = cap
+@@ -56,7 +68,9 @@ class AdbInput:
+     def _run(self, *args: str) -> None:
+         subprocess.run(self.cap.cmd("shell", "input", *args), check=False, capture_output=True)
+ 
+-    def click(self, x: float, y: float, hold_ms: int = 40) -> None:
++    def click(self, x: float, y: float, hold_ms: int = 40, *,
++              intent: ClickIntent = ClickIntent.GENERIC, target: Optional[str] = None) -> None:
++        self._guard_click(intent, target)  # raises PaidRepairBlocked before any adb call
+         sx, sy = self.cap.to_screen(x, y)
+         if hold_ms > 100:
+             self._run("swipe", str(sx), str(sy), str(sx), str(sy), str(hold_ms))
+@@ -64,16 +78,18 @@ class AdbInput:
+             self._run("tap", str(sx), str(sy))
+ 
+     def key(self, key: str, hold_ms: int = 50) -> None:
++        self._guard_key(key)
+         self._run("keyevent", str(ADB_KEYCODES.get(key.lower(), 62)))
+ 
+-    def act(self, x: float, y: float, mode: str) -> None:
++    def act(self, x: float, y: float, mode: str, *, intent: ClickIntent = ClickIntent.GENERIC) -> None:
++        self._guard_click(intent, None)
+         hold = int(self.cfg["bot"].get("hold_ms", 300))
+         if mode == "key":
+             self.key(self.cfg.get("action_key", "space"))
+         elif mode == "hold":
+-            self.click(x, y, hold_ms=hold)
++            self.click(x, y, hold_ms=hold, intent=intent)
+         else:
+-            self.click(x, y)
++            self.click(x, y, intent=intent)
+ 
+     def escape(self) -> None:
+         self.key("esc")
+diff --git a/play-together-fishing-bot/autofishing/safety.py b/play-together-fishing-bot/autofishing/safety.py
+new file mode 100644
+index 0000000..0163fc1
+--- /dev/null
++++ b/play-together-fishing-bot/autofishing/safety.py
+@@ -0,0 +1,210 @@
++"""Paid-repair safety layer (Phase 2A).
++
++Two independent lines of defence live here, deliberately free of heavy
++dependencies (no cv2 / pyautogui / numpy) so they can be unit-tested anywhere:
++
++1. ``classify_repair_ui``  - decides what a repair dialog *is* from detections.
++   Anything that is not positively identified as a free repair step is
++   PAID or UNKNOWN and must never be clicked.
++
++2. ``RepairGuardMixin``    - mixed into ``DesktopInput`` and ``AdbInput``.
++   Even if the bot logic is wrong (or a config value is flipped), the input
++   layer itself refuses to deliver a paid-repair confirmation, refuses
++   unlabeled clicks / confirm-type keypresses while a repair session is
++   active, and refuses to click on a detection that is a paid-repair class.
++
++``allow_paid_repair`` is intentionally NOT consulted anywhere in this module:
++automatic paid-repair confirmation is not a supported operation.
++"""
++from __future__ import annotations
++
++from dataclasses import dataclass
++from enum import Enum, auto
++from typing import Optional
++
++from . import constants as C
++
++# --------------------------------------------------------------------------
++# Policy constants
++# --------------------------------------------------------------------------
++
++#: Detection classes that indicate a paid repair. Seeing ANY of these (at any
++#: confidence) means the dialog is treated as paid.
++PAID_CLASSES = frozenset({C.PAID_REPAIR_BUTTON, C.PAID_REPAIR_TEXT})
++
++#: Keys that may be sent while a repair session is active. They only cancel /
++#: go back; they can never confirm a purchase. Space / Enter are excluded.
++SAFE_REPAIR_KEYS = frozenset({"esc", "escape", "back"})
++
++#: Minimum number of consecutive agreeing frames before a click is automated.
++MIN_CONFIRM_FRAMES = 2
++
++DEFAULT_MIN_CONFIDENCE = 0.50
++DEFAULT_CONFIRM_FRAMES = 2
++
++
++class RepairDialog(Enum):
++    """What the current screen is, as far as the detector can prove."""
++
++    PAID = auto()      # paid-repair evidence present            -> never click
++    DONE = auto()      # positive evidence repair finished       -> may dismiss
++    FREE = auto()      # positive evidence of a free repair step -> may click
++    TAB = auto()       # tools-tab navigation                    -> may click
++    UNKNOWN = auto()   # nothing / ambiguous / low confidence    -> never click
++
++
++class ClickIntent(Enum):
++    """Why the bot is clicking. Declared by the caller, enforced by the input layer."""
++
++    GENERIC = auto()              # ordinary gameplay click (cast / reel / store)
++    NAVIGATION = auto()           # fixed-coordinate bag / rod / close taps
++    TOOLS_TAB = auto()
++    FREE_REPAIR = auto()
++    REPAIR_DONE = auto()
++    PAID_REPAIR_CONFIRM = auto()  # ALWAYS refused
++    UNKNOWN_DIALOG = auto()       # ALWAYS refused
++
++
++#: Intents refused unconditionally, whatever the config says.
++ALWAYS_BLOCKED_INTENTS = frozenset({ClickIntent.PAID_REPAIR_CONFIRM, ClickIntent.UNKNOWN_DIALOG})
++
++
++class PaidRepairBlocked(RuntimeError):
++    """Raised by the input layer when an action violates the repair-safety policy."""
++
++
++def paid_repair_allowed(cfg: Optional[dict] = None) -> bool:
++    """Whether automatic paid-repair confirmation is permitted. Always False.
++
++    ``cfg`` is accepted (and ignored) so call sites read naturally and so a
++    test can prove that ``allow_paid_repair: true`` changes nothing.
++    """
++    return False
++
++
++# --------------------------------------------------------------------------
++# Dialog classification
++# --------------------------------------------------------------------------
++
++
++@dataclass(frozen=True)
++class RepairDecision:
++    state: RepairDialog
++    target: object = None  # a Det (has .name / .conf / .center) or None
++    reason: str = ""
++    ambiguous: bool = False  # UNKNOWN because evidence existed but was weak / conflicting
++
++    @property
++    def clickable(self) -> bool:
++        return self.state in (RepairDialog.FREE, RepairDialog.DONE, RepairDialog.TAB)
++
++    @property
++    def intent(self) -> ClickIntent:
++        return {
++            RepairDialog.FREE: ClickIntent.FREE_REPAIR,
++            RepairDialog.DONE: ClickIntent.REPAIR_DONE,
++            RepairDialog.TAB: ClickIntent.TOOLS_TAB,
++            RepairDialog.PAID: ClickIntent.PAID_REPAIR_CONFIRM,
++        }.get(self.state, ClickIntent.UNKNOWN_DIALOG)
++
++
++def _best(ui: dict, *names: str):
++    cands = [ui[n] for n in names if n in ui]
++    return max(cands, key=lambda d: d.conf) if cands else None
++
++
++def classify_repair_ui(ui: dict, min_conf: float = DEFAULT_MIN_CONFIDENCE) -> RepairDecision:
++    """Classify detections (``{class_name: Det}``) into a :class:`RepairDecision`.
++
++    Precedence is fail-safe: PAID beats everything; a free action needs
++    positive, sufficiently confident evidence; everything else is UNKNOWN.
++    """
++    # 1. Any paid evidence, at any confidence, blocks the dialog outright.
++    paid = _best(ui, *sorted(PAID_CLASSES))
++    if paid is not None:
++        return RepairDecision(RepairDialog.PAID, paid, f"paid evidence: {paid.name} ({paid.conf:.2f})")
++
++    # 2. Repair finished: dismissing it is harmless, but still needs evidence.
++    done = _best(ui, C.REPAIR_DONE_BUTTON, C.REPAIR_DONE_TEXT)
++    if done is not None:
++        if done.conf >= min_conf:
++            return RepairDecision(RepairDialog.DONE, done, f"repair-done evidence ({done.conf:.2f})")
++        return RepairDecision(RepairDialog.UNKNOWN, None,
++                              f"repair-done below confidence {min_conf:.2f} ({done.conf:.2f})", True)
++
++    # 3. Free repair: requires the repair button at sufficient confidence.
++    rep = ui.get(C.REPAIR_BUTTON)
++    if rep is not None and rep.conf >= min_conf:
++        return RepairDecision(RepairDialog.FREE, rep, f"free-repair evidence ({rep.conf:.2f})")
++
++    # 4. Navigation to the tools tab (harmless, not a confirmation).
++    tab = ui.get(C.TOOL_TAB)
++    if tab is not None:
++        return RepairDecision(RepairDialog.TAB, tab, "tools tab visible")
++
++    if rep is not None:
++        return RepairDecision(RepairDialog.UNKNOWN, None,
++                              f"repair-button below confidence {min_conf:.2f} ({rep.conf:.2f})", True)
++    return RepairDecision(RepairDialog.UNKNOWN, None, "no recognised repair dialog")
++
++
++def same_evidence(a: RepairDecision, b: RepairDecision, tol_px: float = 30.0) -> bool:
++    """True if two decisions are the same clickable state on (nearly) the same spot."""
++    if a.state != b.state or not a.clickable or a.target is None or b.target is None:
++        return False
++    if a.target.name != b.target.name:
++        return False
++    (ax, ay), (bx, by) = a.target.center, b.target.center
++    return abs(ax - bx) <= tol_px and abs(ay - by) <= tol_px
++
++
++# --------------------------------------------------------------------------
++# Input-layer enforcement
++# --------------------------------------------------------------------------
++
++
++def check_click(intent: ClickIntent, in_repair_session: bool, target: Optional[str] = None) -> None:
++    """Raise :class:`PaidRepairBlocked` if a click violates policy."""
++    if intent in ALWAYS_BLOCKED_INTENTS:
++        raise PaidRepairBlocked(f"click blocked: intent {intent.name} is never permitted")
++    if target is not None and target in PAID_CLASSES:
++        raise PaidRepairBlocked(f"click blocked: target '{target}' is a paid-repair control")
++    if in_repair_session and intent is ClickIntent.GENERIC:
++        raise PaidRepairBlocked("click blocked: unlabeled click during repair session")
++
++
++def check_key(key: str, in_repair_session: bool) -> None:
++    """Raise :class:`PaidRepairBlocked` if a keypress could confirm a dialog."""
++    if in_repair_session and str(key).lower() not in SAFE_REPAIR_KEYS:
++        raise PaidRepairBlocked(f"key '{key}' blocked during repair session (could confirm a dialog)")
++
++
++class RepairGuardMixin:
++    """Shared by ``DesktopInput`` and ``AdbInput`` so both enforce identical rules."""
++
++    _repair_depth: int = 0
++    blocked_actions: int = 0
++
++    def begin_repair_session(self) -> None:
++        self._repair_depth += 1
++
++    def end_repair_session(self) -> None:
++        self._repair_depth = max(0, self._repair_depth - 1)
++
++    @property
++    def in_repair_session(self) -> bool:
++        return self._repair_depth > 0
++
++    def _guard_click(self, intent: ClickIntent, target: Optional[str]) -> None:
++        try:
++            check_click(intent, self.in_repair_session, target)
++        except PaidRepairBlocked:
++            self.blocked_actions += 1
++            raise
++
++    def _guard_key(self, key: str) -> None:
++        try:
++            check_key(key, self.in_repair_session)
++        except PaidRepairBlocked:
++            self.blocked_actions += 1
++            raise
+diff --git a/play-together-fishing-bot/config.yaml b/play-together-fishing-bot/config.yaml
+index be11191..f675357 100644
+--- a/play-together-fishing-bot/config.yaml
++++ b/play-together-fishing-bot/config.yaml
+@@ -62,9 +62,15 @@ bot:
+   hold_ms: 300             # used by *_mode: hold
+ 
+ # --- Repair ---------------------------------------------------------------
+-allow_paid_repair: true
++# SAFETY: paid repairs are NEVER confirmed automatically, whatever this is set to.
++# Kept false; if a paid repair dialog appears the bot stops so you can handle it manually.
++allow_paid_repair: false
+ repair_timeout_ms: 25000
+ repair_click_gap_ms: 700
++# A free-repair click needs the repair button at >= this confidence on N consecutive frames.
++repair_min_confidence: 0.50
++repair_confirm_frames: 2        # minimum 2 (enforced in code)
++repair_confirm_interval_ms: 150
+ 
+ bag_x: 1537
+ bag_y: 500
+diff --git a/play-together-fishing-bot/pytest.ini b/play-together-fishing-bot/pytest.ini
+new file mode 100644
+index 0000000..5ee6477
+--- /dev/null
++++ b/play-together-fishing-bot/pytest.ini
+@@ -0,0 +1,2 @@
++[pytest]
++testpaths = tests
+diff --git a/play-together-fishing-bot/requirements-dev.txt b/play-together-fishing-bot/requirements-dev.txt
+new file mode 100644
+index 0000000..a8360ef
+--- /dev/null
++++ b/play-together-fishing-bot/requirements-dev.txt
+@@ -0,0 +1,2 @@
++pytest>=7.0
++PyYAML>=6.0.0
+diff --git a/play-together-fishing-bot/tests/conftest.py b/play-together-fishing-bot/tests/conftest.py
+new file mode 100644
+index 0000000..e98f66b
+--- /dev/null
++++ b/play-together-fishing-bot/tests/conftest.py
+@@ -0,0 +1,200 @@
++"""Shared fixtures. No emulator, OpenCV, PyAutoGUI or ADB is needed: the OS layer is faked,
++but the real DesktopInput / AdbInput / FishingBot / safety code is what runs."""
++from __future__ import annotations
++
++import os
++import sys
++import types
++
++import pytest
++
++ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++if ROOT not in sys.path:
++    sys.path.insert(0, ROOT)
++
++from autofishing import constants as C  # noqa: E402
++from autofishing.config import load_config  # noqa: E402
++from autofishing.input import AdbInput, DesktopInput  # noqa: E402
++
++
++def _load_det():
++    """Load the tiny Det dataclass straight from its file: importing the `autofishing.detection`
++    package would pull in OpenCV, which these tests deliberately do not need."""
++    import importlib.util
++
++    spec = importlib.util.spec_from_file_location(
++        "_det_base", os.path.join(ROOT, "autofishing", "detection", "base.py"))
++    mod = importlib.util.module_from_spec(spec)
++    sys.modules["_det_base"] = mod  # dataclasses needs the module registered
++    spec.loader.exec_module(mod)
++    return mod.Det
++
++
++Det = _load_det()
++
++
++def det(name: str, conf: float = 0.9, cx: float = 100, cy: float = 100) -> Det:
++    return Det(name, conf, (cx - 10, cy - 10, cx + 10, cy + 10))
++
++
++# Distinct positions so we can tell exactly what was clicked.
++POS = {
++    "bag": (1537, 500),
++    "close": (1600, 40),
++    C.TOOL_TAB: (300, 120),
++    C.REPAIR_BUTTON: (400, 500),
++    C.PAID_REPAIR_BUTTON: (500, 600),
++    C.PAID_REPAIR_TEXT: (500, 450),
++    C.REPAIR_DONE_BUTTON: (700, 650),
++    C.REPAIR_DONE_TEXT: (700, 640),
++    C.STORE_BUTTON: (1153, 600),
++    C.TOOL_BROKEN: (800, 300),
++}
++
++
++def d(name: str, conf: float = 0.9) -> Det:
++    x, y = POS[name]
++    return det(name, conf, x, y)
++
++
++class FakeCap:
++    """Replays a scripted list of 'screens'. Each screen is a list of Det. Last one repeats."""
++
++    def __init__(self, script, cycle=False):
++        self.script = list(script)
++        self.cycle = cycle  # True: loop the script forever instead of repeating the last screen
++        self.i = 0
++        self.grabs = 0
++
++    def grab(self):
++        idx = self.i % len(self.script) if self.cycle else min(self.i, len(self.script) - 1)
++        self.i += 1
++        self.grabs += 1
++        return idx
++
++    def screen(self, idx):
++        return self.script[idx]
++
++    # used by the input backends
++    def to_screen(self, x, y):
++        return int(x), int(y)
++
++    def cmd(self, *args):
++        return ["adb", *args]
++
++
++class FakeDetector:
++    def __init__(self, cap: FakeCap):
++        self.cap = cap
++
++    def detect(self, frame, conf=0, imgsz=0, only=None):
++        return [x for x in self.cap.screen(frame) if not only or x.name in only]
++
++
++class FakeKeys:
++    def __init__(self):
++        self.stopped = False
++
++    def alive(self):
++        return not self.stopped
++
++    def stop(self):
++        self.stopped = True
++
++
++class FakePyAutoGUI(types.ModuleType):
++    """Stand-in for pyautogui / pydirectinput that records raw OS-level input."""
++
++    def __init__(self):
++        super().__init__("pyautogui")
++        self.PAUSE = 0
++        self.FAILSAFE = True
++        self.pos = (0, 0)
++        self.clicks = []   # (x, y) at mouseDown
++        self.keys = []     # key names pressed
++
++    def moveTo(self, x, y):
++        self.pos = (x, y)
++
++    def mouseDown(self):
++        self.clicks.append(self.pos)
++
++    def mouseUp(self):
++        pass
++
++    def keyDown(self, k):
++        self.keys.append(k)
++
++    def keyUp(self, k):
++        pass
++
++
++class Backend:
++    """Uniform view over both input backends: .inp, .clicks (screen coords), .keys."""
++
++    def __init__(self, inp, get_clicks, get_keys):
++        self.inp = inp
++        self._get_clicks, self._get_keys = get_clicks, get_keys
++
++    @property
++    def clicks(self):
++        return list(self._get_clicks())
++
++    @property
++    def keys(self):
++        return list(self._get_keys())
++
++
++def make_cfg(**over):
++    cfg = load_config("does-not-exist.yaml")  # pure defaults
++    cfg["repair_click_gap_ms"] = 0
++    cfg["repair_confirm_interval_ms"] = 0
++    cfg["repair_timeout_ms"] = 400
++    cfg["bot"]["cooldown_after_bite_ms"] = 0
++    cfg.update(over)
++    return cfg
++
++
++@pytest.fixture(params=["desktop", "adb"])
++def backend(request, monkeypatch):
++    cfg = make_cfg()
++    cap = FakeCap([[]])
++    if request.param == "desktop":
++        fake = FakePyAutoGUI()
++        monkeypatch.setitem(sys.modules, "pyautogui", fake)
++        inp = DesktopInput(cfg, cap)
++        return Backend(inp, lambda: fake.clicks, lambda: fake.keys)
++
++    calls = []
++
++    def fake_run(argv, **kw):
++        calls.append(argv)
++        return types.SimpleNamespace(returncode=0)
++
++    monkeypatch.setattr("autofishing.input.controller.subprocess.run", fake_run)
++    inp = AdbInput(cfg, cap)
++
++    def adb_clicks():
++        out = []
++        for a in calls:
++            if "tap" in a:
++                out.append((int(a[-2]), int(a[-1])))
++            elif "swipe" in a:
++                out.append((int(a[-5]), int(a[-4])))
++        return out
++
++    return Backend(inp, adb_clicks, lambda: [a[-1] for a in calls if "keyevent" in a])
++
++
++def build_bot(script, backend, cycle=False, **cfg_over):
++    from autofishing.bot import FishingBot
++
++    cap = FakeCap(script, cycle=cycle)
++    keys = FakeKeys()
++    cfg = make_cfg(**cfg_over)
++    backend.inp.cfg = cfg
++    backend.inp.cap = cap
++    bot = FishingBot(cfg, cap, backend.inp, FakeDetector(cap), keys)
++    bot.log = lambda msg: bot.logs.append(msg)
++    bot.logs = []
++    return bot, keys
+diff --git a/play-together-fishing-bot/tests/test_input_guard.py b/play-together-fishing-bot/tests/test_input_guard.py
+new file mode 100644
+index 0000000..f5a08c7
+--- /dev/null
++++ b/play-together-fishing-bot/tests/test_input_guard.py
+@@ -0,0 +1,145 @@
++"""Input-layer enforcement. Every test runs against BOTH DesktopInput and AdbInput
++(the `backend` fixture is parametrised) and asserts that blocked actions never
++reach the OS / adb layer."""
++from __future__ import annotations
++
++import pytest
++
++from autofishing import constants as C
++from autofishing.input import AdbInput, DesktopInput
++from autofishing.safety import ClickIntent, PaidRepairBlocked
++
++
++def test_fixture_covers_both_backends(backend):
++    assert isinstance(backend.inp, (DesktopInput, AdbInput))
++
++
++class TestNormalGameplayPreserved:
++    def test_generic_click_outside_session_works(self, backend):
++        backend.inp.click(10, 20)
++        assert backend.clicks == [(10, 20)]
++
++    @pytest.mark.parametrize("mode", ["tap", "hold"])
++    def test_act_tap_and_hold_work(self, backend, mode):
++        backend.inp.act(30, 40, mode)
++        assert backend.clicks == [(30, 40)]
++
++    def test_key_mode_works_outside_session(self, backend):
++        backend.inp.act(0, 0, "key")
++        assert len(backend.keys) == 1 and backend.clicks == []
++
++    def test_escape_works(self, backend):
++        backend.inp.escape()
++        assert len(backend.keys) == 1
++
++
++class TestPaidConfirmAlwaysBlocked:
++    @pytest.mark.parametrize("session", [False, True])
++    def test_paid_confirm_intent_blocked(self, backend, session):
++        if session:
++            backend.inp.begin_repair_session()
++        with pytest.raises(PaidRepairBlocked):
++            backend.inp.click(500, 600, intent=ClickIntent.PAID_REPAIR_CONFIRM)
++        assert backend.clicks == []
++        assert backend.inp.blocked_actions == 1
++
++    @pytest.mark.parametrize("session", [False, True])
++    def test_unknown_dialog_intent_blocked(self, backend, session):
++        if session:
++            backend.inp.begin_repair_session()
++        with pytest.raises(PaidRepairBlocked):
++            backend.inp.click(1, 1, intent=ClickIntent.UNKNOWN_DIALOG)
++        assert backend.clicks == []
++
++    @pytest.mark.parametrize("target", [C.PAID_REPAIR_BUTTON, C.PAID_REPAIR_TEXT])
++    @pytest.mark.parametrize("intent", [ClickIntent.GENERIC, ClickIntent.FREE_REPAIR,
++                                         ClickIntent.REPAIR_DONE, ClickIntent.NAVIGATION])
++    def test_mislabelled_paid_target_blocked(self, backend, target, intent):
++        """Even if the bot mislabels a paid control as 'free repair', the input layer refuses."""
++        backend.inp.begin_repair_session()
++        with pytest.raises(PaidRepairBlocked):
++            backend.inp.click(500, 600, intent=intent, target=target)
++        assert backend.clicks == []
++
++    @pytest.mark.parametrize("allow", [False, True])
++    def test_allow_paid_repair_true_cannot_bypass(self, backend, allow):
++        backend.inp.cfg["allow_paid_repair"] = allow
++        backend.inp.begin_repair_session()
++        with pytest.raises(PaidRepairBlocked):
++            backend.inp.click(500, 600, intent=ClickIntent.PAID_REPAIR_CONFIRM,
++                              target=C.PAID_REPAIR_BUTTON)
++        with pytest.raises(PaidRepairBlocked):
++            backend.inp.act(500, 600, "tap", intent=ClickIntent.PAID_REPAIR_CONFIRM)
++        assert backend.clicks == []
++
++    @pytest.mark.parametrize("mode", ["tap", "hold", "key"])
++    def test_act_with_blocked_intent_blocked_in_every_mode(self, backend, mode):
++        with pytest.raises(PaidRepairBlocked):
++            backend.inp.act(1, 1, mode, intent=ClickIntent.PAID_REPAIR_CONFIRM)
++        assert backend.clicks == [] and backend.keys == []
++
++
++class TestRepairSession:
++    def test_unlabelled_click_blocked_in_session(self, backend):
++        backend.inp.begin_repair_session()
++        with pytest.raises(PaidRepairBlocked):
++            backend.inp.click(5, 5)
++        assert backend.clicks == []
++
++    def test_unlabelled_act_blocked_in_session(self, backend):
++        backend.inp.begin_repair_session()
++        with pytest.raises(PaidRepairBlocked):
++            backend.inp.act(5, 5, "tap")
++        assert backend.clicks == []
++
++    @pytest.mark.parametrize("intent", [ClickIntent.NAVIGATION, ClickIntent.TOOLS_TAB,
++                                         ClickIntent.FREE_REPAIR, ClickIntent.REPAIR_DONE])
++    def test_free_labelled_clicks_work_in_session(self, backend, intent):
++        backend.inp.begin_repair_session()
++        backend.inp.click(7, 8, intent=intent, target=C.REPAIR_BUTTON)
++        assert backend.clicks == [(7, 8)]
++
++    def test_act_navigation_works_in_session(self, backend):
++        backend.inp.begin_repair_session()
++        backend.inp.act(9, 9, "tap", intent=ClickIntent.NAVIGATION)
++        assert backend.clicks == [(9, 9)]
++
++    @pytest.mark.parametrize("key", ["space", "enter"])
++    def test_confirm_keys_blocked_in_session(self, backend, key):
++        backend.inp.begin_repair_session()
++        with pytest.raises(PaidRepairBlocked):
++            backend.inp.key(key)
++        assert backend.keys == []
++
++    def test_key_mode_act_blocked_in_session(self, backend):
++        backend.inp.begin_repair_session()
++        with pytest.raises(PaidRepairBlocked):
++            backend.inp.act(0, 0, "key", intent=ClickIntent.NAVIGATION)
++        assert backend.keys == []
++
++    def test_escape_allowed_in_session(self, backend):
++        backend.inp.begin_repair_session()
++        backend.inp.escape()
++        assert len(backend.keys) == 1
++
++    def test_session_ends_and_gameplay_resumes(self, backend):
++        backend.inp.begin_repair_session()
++        assert backend.inp.in_repair_session
++        backend.inp.end_repair_session()
++        assert not backend.inp.in_repair_session
++        backend.inp.click(1, 2)
++        assert backend.clicks == [(1, 2)]
++
++    def test_sessions_nest(self, backend):
++        backend.inp.begin_repair_session()
++        backend.inp.begin_repair_session()
++        backend.inp.end_repair_session()
++        assert backend.inp.in_repair_session
++        backend.inp.end_repair_session()
++        backend.inp.end_repair_session()  # extra end never goes negative
++        assert not backend.inp.in_repair_session
++
++    def test_session_is_per_instance(self, backend):
++        backend.inp.begin_repair_session()
++        other = type(backend.inp)(backend.inp.cfg, backend.inp.cap)
++        assert not other.in_repair_session
+diff --git a/play-together-fishing-bot/tests/test_repair_flow.py b/play-together-fishing-bot/tests/test_repair_flow.py
+new file mode 100644
+index 0000000..73eef25
+--- /dev/null
++++ b/play-together-fishing-bot/tests/test_repair_flow.py
+@@ -0,0 +1,215 @@
++"""End-to-end repair-state tests: real FishingBot + real input backend (both), scripted screens."""
++from __future__ import annotations
++
++import pytest
++
++from autofishing import constants as C
++from autofishing.bot import State
++from autofishing.bot import fishing_bot as fb
++from autofishing.safety import PaidRepairBlocked, RepairDecision, RepairDialog
++from conftest import POS, build_bot, d
++
++BAG = POS["bag"]
++REPAIR = POS[C.REPAIR_BUTTON]
++DONE_BTN = POS[C.REPAIR_DONE_BUTTON]
++DONE_TXT = POS[C.REPAIR_DONE_TEXT]
++TAB = POS[C.TOOL_TAB]
++PAID_POSITIONS = {POS[C.PAID_REPAIR_BUTTON], POS[C.PAID_REPAIR_TEXT]}
++
++
++def run_repair(script, backend, cycle=False, **cfg):
++    bot, keys = build_bot(script, backend, cycle=cycle, **cfg)
++    result = bot.s_repair()
++    return bot, keys, result
++
++
++# ------------------------------------------------------------------ paid repair
++class TestPaidRepairNeverConfirmed:
++    @pytest.mark.parametrize("allow", [False, True])
++    @pytest.mark.parametrize("paid", [C.PAID_REPAIR_BUTTON, C.PAID_REPAIR_TEXT])
++    def test_paid_dialog_is_not_clicked_and_bot_stops(self, backend, allow, paid):
++        bot, keys, res = run_repair([[d(paid)]], backend, allow_paid_repair=allow)
++        assert backend.clicks == [BAG]                  # only the backpack tap, nothing else
++        assert keys.stopped and res is State.COOLDOWN
++        assert bot.stats.repairs == 0
++        assert any("NOT confirming" in m for m in bot.logs)
++
++    @pytest.mark.parametrize("allow", [False, True])
++    def test_paid_button_plus_text_not_clicked(self, backend, allow):
++        run_repair([[d(C.PAID_REPAIR_BUTTON), d(C.PAID_REPAIR_TEXT)]], backend, allow_paid_repair=allow)
++        assert backend.clicks == [BAG]
++
++    @pytest.mark.parametrize("allow", [False, True])
++    def test_repair_button_alongside_paid_evidence_is_not_clicked(self, backend, allow):
++        """Ambiguous: looks like free repair AND paid. Paid wins; nothing clicked."""
++        run_repair([[d(C.REPAIR_BUTTON, 0.99), d(C.PAID_REPAIR_TEXT, 0.4)]], backend, allow_paid_repair=allow)
++        assert backend.clicks == [BAG]
++
++    def test_done_alongside_paid_evidence_is_not_clicked(self, backend):
++        run_repair([[d(C.REPAIR_DONE_BUTTON, 0.99), d(C.PAID_REPAIR_BUTTON, 0.4)]], backend)
++        assert backend.clicks == [BAG]
++
++    @pytest.mark.parametrize("allow", [False, True])
++    def test_free_repair_click_then_paid_dialog_appears(self, backend, allow):
++        """Realistic: tap repair -> cost dialog. The paid confirm must not be tapped."""
++        script = [[d(C.REPAIR_BUTTON)]] * 4 + [[d(C.PAID_REPAIR_BUTTON), d(C.PAID_REPAIR_TEXT)]]
++        bot, keys, _ = run_repair(script, backend, allow_paid_repair=allow)
++        assert REPAIR in backend.clicks
++        assert not (set(backend.clicks) & PAID_POSITIONS)
++        assert keys.stopped and bot.stats.repairs == 0
++
++    def test_paid_dialog_appearing_during_confirmation_blocks_the_click(self, backend):
++        """Screen flips free -> paid between the first look and the pre-click re-check."""
++        script = [[d(C.REPAIR_BUTTON)], [d(C.PAID_REPAIR_BUTTON)]]
++        bot, keys, _ = run_repair(script, backend)
++        assert backend.clicks == [BAG]  # the repair button was NOT clicked
++        assert keys.stopped
++
++    def test_paid_never_clicked_even_with_close_coordinates_set(self, backend):
++        run_repair([[d(C.PAID_REPAIR_BUTTON)]], backend, close_x=1600, close_y=40)
++        assert backend.clicks == [BAG]  # no blind close-tap on top of a paid dialog
++
++
++# ------------------------------------------------------------------ unknown / ambiguous
++class TestUnknownAndAmbiguousBlocked:
++    def test_unknown_dialog_never_clicked(self, backend):
++        bot, keys, res = run_repair([[]], backend)       # nothing recognised for the whole timeout
++        assert backend.clicks == [BAG]
++        assert res is State.COOLDOWN
++        assert not keys.stopped                           # nothing ambiguous seen -> legacy timeout path
++        assert bot.stats.repairs == 0
++
++    def test_unrelated_detections_never_clicked(self, backend):
++        run_repair([[d(C.STORE_BUTTON), d(C.TOOL_BROKEN)]], backend)
++        assert backend.clicks == [BAG]
++
++    def test_low_confidence_repair_button_not_clicked_and_bot_stops(self, backend):
++        bot, keys, _ = run_repair([[d(C.REPAIR_BUTTON, 0.40)]], backend)
++        assert backend.clicks == [BAG]
++        assert keys.stopped
++        assert any("ambiguous" in m for m in bot.logs)
++
++    def test_low_confidence_done_not_clicked(self, backend):
++        bot, keys, _ = run_repair([[d(C.REPAIR_DONE_BUTTON, 0.40)]], backend)
++        assert backend.clicks == [BAG] and bot.stats.repairs == 0 and keys.stopped
++
++    def test_no_blind_bag_retap_on_unrecognised_screen(self, backend):
++        """The old code re-tapped the bag every 6 idle polls; an unrecognised screen may be a dialog."""
++        run_repair([[]], backend, repair_timeout_ms=600)
++        assert backend.clicks.count(BAG) == 1
++
++    def test_single_frame_flicker_is_not_enough(self, backend):
++        script = [[d(C.REPAIR_BUTTON)], []]  # appears one frame at a time, never two in a row
++        run_repair(script, backend, cycle=True)
++        assert REPAIR not in backend.clicks
++
++    def test_target_jumping_between_frames_is_not_clicked(self, backend):
++        from conftest import det
++        script = [[det(C.REPAIR_BUTTON, 0.9, 100, 100)], [det(C.REPAIR_BUTTON, 0.9, 900, 700)]]
++        run_repair(script, backend, cycle=True)
++        assert backend.clicks == [BAG]
++
++    def test_tab_that_never_opens_rod_list_stops_clicking_after_three(self, backend):
++        run_repair([[d(C.TOOL_TAB)]], backend, repair_timeout_ms=600)
++        assert backend.clicks.count(TAB) == 3
++
++
++# ------------------------------------------------------------------ free repair preserved
++class TestFreeRepairStillWorks:
++    def test_free_repair_flow(self, backend):
++        script = [[d(C.REPAIR_BUTTON)]] * 4 + [[d(C.REPAIR_DONE_BUTTON)]]
++        bot, keys, res = run_repair(script, backend)
++        assert backend.clicks[0] == BAG
++        assert REPAIR in backend.clicks
++        assert backend.clicks[-1] == DONE_BTN
++        assert bot.stats.repairs == 1
++        assert res is State.COOLDOWN and not keys.stopped
++
++    def test_free_repair_via_done_text_only(self, backend):
++        script = [[d(C.REPAIR_BUTTON)]] * 4 + [[d(C.REPAIR_DONE_TEXT)]]
++        bot, keys, _ = run_repair(script, backend)
++        assert backend.clicks[-1] == DONE_TXT and bot.stats.repairs == 1 and not keys.stopped
++
++    def test_tools_tab_then_repair(self, backend):
++        script = [[d(C.TOOL_TAB)]] * 2 + [[d(C.REPAIR_BUTTON)]] * 4 + [[d(C.REPAIR_DONE_BUTTON)]]
++        bot, keys, _ = run_repair(script, backend)
++        assert backend.clicks[:2] == [BAG, TAB]
++        assert REPAIR in backend.clicks and bot.stats.repairs == 1 and not keys.stopped
++
++    def test_rod_slot_and_close_navigation_still_work(self, backend):
++        script = [[d(C.TOOL_TAB)]] * 2 + [[d(C.REPAIR_BUTTON)]] * 4 + [[d(C.REPAIR_DONE_BUTTON)]]
++        run_repair(script, backend, rod_x=222, rod_y=333, close_x=1600, close_y=40)
++        assert (222, 333) in backend.clicks
++        assert backend.clicks[-1] == (1600, 40)
++
++    def test_repair_at_exact_min_confidence_works(self, backend):
++        script = [[d(C.REPAIR_BUTTON, 0.50)]] * 4 + [[d(C.REPAIR_DONE_BUTTON, 0.50)]]
++        bot, _, _ = run_repair(script, backend)
++        assert bot.stats.repairs == 1
++
++    def test_min_confidence_is_configurable(self, backend):
++        script = [[d(C.REPAIR_BUTTON, 0.40)]] * 4 + [[d(C.REPAIR_DONE_BUTTON, 0.40)]]
++        bot, _, _ = run_repair(script, backend, repair_min_confidence=0.30)
++        assert bot.stats.repairs == 1
++
++    def test_allow_paid_repair_true_does_not_change_free_flow(self, backend):
++        script = [[d(C.REPAIR_BUTTON)]] * 4 + [[d(C.REPAIR_DONE_BUTTON)]]
++        bot, keys, _ = run_repair(script, backend, allow_paid_repair=True)
++        assert bot.stats.repairs == 1 and not keys.stopped
++
++    def test_confirm_frames_config_cannot_go_below_two(self, backend):
++        """repair_confirm_frames=0/1 must not disable the pre-click re-check."""
++        script = [[d(C.REPAIR_BUTTON)], [d(C.PAID_REPAIR_BUTTON)]]
++        bot, keys, _ = run_repair(script, backend, repair_confirm_frames=1)
++        assert backend.clicks == [BAG] and keys.stopped
++
++    def test_normal_gameplay_clicks_still_use_input(self, backend):
++        bot, _ = build_bot([[]], backend)
++        bot.act(11, 22, "tap")                      # cast / reel / store path (GENERIC intent)
++        assert backend.clicks == [(11, 22)]
++
++
++# ------------------------------------------------------------------ defence in depth
++class TestDefenceInDepth:
++    def test_input_layer_stops_a_buggy_classifier(self, backend, monkeypatch):
++        """If the classifier were wrong and called a paid button 'free', the input layer still refuses."""
++        paid = d(C.PAID_REPAIR_BUTTON)
++        monkeypatch.setattr(fb, "classify_repair_ui",
++                            lambda ui, min_conf=0.5: RepairDecision(RepairDialog.FREE, paid, "bug"))
++        bot, keys = build_bot([[paid]], backend, allow_paid_repair=True)
++        with pytest.raises(PaidRepairBlocked):
++            bot.s_repair()
++        assert backend.clicks == [BAG]
++        assert not backend.inp.in_repair_session        # session closed even on error (finally)
++
++    def test_session_closed_after_normal_and_aborted_repairs(self, backend):
++        run_repair([[d(C.PAID_REPAIR_BUTTON)]], backend)
++        assert not backend.inp.in_repair_session
++        run_repair([[]], backend)
++        assert not backend.inp.in_repair_session
++
++    def test_bot_refuses_repair_if_input_backend_has_no_guard(self):
++        from conftest import FakeCap, FakeDetector, FakeKeys, make_cfg
++        from autofishing.bot import FishingBot
++
++        class Bare:                       # an input object with no safety layer
++            def __init__(self): self.calls = []
++            def act(self, *a, **k): self.calls.append(("act", a))
++            def click(self, *a, **k): self.calls.append(("click", a))
++
++        cap, keys, inp = FakeCap([[d(C.REPAIR_BUTTON)]]), FakeKeys(), Bare()
++        bot = FishingBot(make_cfg(), cap, inp, FakeDetector(cap), keys)
++        bot.log = lambda m: None
++        assert bot.s_repair() is State.COOLDOWN
++        assert keys.stopped and inp.calls == []
++
++    def test_allow_paid_repair_true_logs_warning_at_startup(self):
++        from conftest import FakeCap, FakeDetector, FakeKeys, make_cfg
++        from autofishing.bot import FishingBot
++        import io, contextlib
++
++        cap = FakeCap([[]])
++        buf = io.StringIO()
++        with contextlib.redirect_stdout(buf):
++            FishingBot(make_cfg(allow_paid_repair=True), cap, object(), FakeDetector(cap), FakeKeys())
++        assert "IGNORED" in buf.getvalue()
+diff --git a/play-together-fishing-bot/tests/test_safety_policy.py b/play-together-fishing-bot/tests/test_safety_policy.py
+new file mode 100644
+index 0000000..0b87833
+--- /dev/null
++++ b/play-together-fishing-bot/tests/test_safety_policy.py
+@@ -0,0 +1,165 @@
++"""Pure-logic tests: dialog classification, click/key policy and config defaults."""
++from __future__ import annotations
++
++import os
++
++import pytest
++import yaml
++
++from autofishing import constants as C
++from autofishing.config import DEFAULTS, load_config
++from autofishing.safety import (
++    ClickIntent,
++    PaidRepairBlocked,
++    RepairDialog,
++    check_click,
++    check_key,
++    classify_repair_ui,
++    paid_repair_allowed,
++)
++from conftest import d
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++REPO_CONFIG = os.path.join(os.path.dirname(HERE), "config.yaml")
++
++
++def ui(*dets):
++    return {x.name: x for x in dets}
++
++
++# ---------------------------------------------------------------- classification
++class TestClassification:
++    def test_free_repair_needs_confident_repair_button(self):
++        r = classify_repair_ui(ui(d(C.REPAIR_BUTTON, 0.9)))
++        assert r.state is RepairDialog.FREE and r.clickable
++        assert r.intent is ClickIntent.FREE_REPAIR
++
++    def test_repair_button_exactly_at_threshold_is_accepted(self):
++        assert classify_repair_ui(ui(d(C.REPAIR_BUTTON, 0.50)), 0.50).state is RepairDialog.FREE
++
++    def test_low_confidence_repair_button_is_unknown_and_ambiguous(self):
++        r = classify_repair_ui(ui(d(C.REPAIR_BUTTON, 0.40)), 0.50)
++        assert r.state is RepairDialog.UNKNOWN and not r.clickable and r.ambiguous
++        assert r.intent is ClickIntent.UNKNOWN_DIALOG
++
++    def test_empty_screen_is_unknown_not_ambiguous(self):
++        r = classify_repair_ui({})
++        assert r.state is RepairDialog.UNKNOWN and not r.clickable and not r.ambiguous
++
++    @pytest.mark.parametrize("name", [C.PAID_REPAIR_BUTTON, C.PAID_REPAIR_TEXT])
++    @pytest.mark.parametrize("conf", [0.05, 0.35, 0.99])
++    def test_any_paid_evidence_is_paid_at_any_confidence(self, name, conf):
++        r = classify_repair_ui(ui(d(name, conf)))
++        assert r.state is RepairDialog.PAID and not r.clickable
++        assert r.intent is ClickIntent.PAID_REPAIR_CONFIRM
++
++    @pytest.mark.parametrize("other", [
++        d(C.REPAIR_BUTTON, 0.99), d(C.REPAIR_DONE_BUTTON, 0.99),
++        d(C.REPAIR_DONE_TEXT, 0.99), d(C.TOOL_TAB, 0.99),
++    ])
++    def test_paid_evidence_beats_everything_else(self, other):
++        r = classify_repair_ui(ui(other, d(C.PAID_REPAIR_TEXT, 0.4)))
++        assert r.state is RepairDialog.PAID
++
++    def test_done_requires_confidence(self):
++        assert classify_repair_ui(ui(d(C.REPAIR_DONE_BUTTON, 0.9))).state is RepairDialog.DONE
++        low = classify_repair_ui(ui(d(C.REPAIR_DONE_TEXT, 0.4)))
++        assert low.state is RepairDialog.UNKNOWN and low.ambiguous
++
++    def test_low_confidence_done_does_not_fall_through_to_free(self):
++        r = classify_repair_ui(ui(d(C.REPAIR_DONE_TEXT, 0.4), d(C.REPAIR_BUTTON, 0.99)))
++        assert r.state is RepairDialog.UNKNOWN
++
++    def test_done_takes_priority_over_free_when_both_confident(self):
++        r = classify_repair_ui(ui(d(C.REPAIR_DONE_BUTTON, 0.9), d(C.REPAIR_BUTTON, 0.9)))
++        assert r.state is RepairDialog.DONE
++
++    def test_tab_only_when_no_repair_evidence(self):
++        assert classify_repair_ui(ui(d(C.TOOL_TAB))).state is RepairDialog.TAB
++        both = classify_repair_ui(ui(d(C.TOOL_TAB), d(C.REPAIR_BUTTON, 0.9)))
++        assert both.state is RepairDialog.FREE
++
++    def test_low_confidence_repair_with_tab_navigates_tab(self):
++        assert classify_repair_ui(ui(d(C.TOOL_TAB), d(C.REPAIR_BUTTON, 0.4))).state is RepairDialog.TAB
++
++    def test_unrelated_classes_are_unknown(self):
++        assert classify_repair_ui(ui(d(C.STORE_BUTTON), d(C.TOOL_BROKEN))).state is RepairDialog.UNKNOWN
++
++
++# ---------------------------------------------------------------- policy functions
++class TestPolicy:
++    @pytest.mark.parametrize("cfg", [None, {}, {"allow_paid_repair": False}, {"allow_paid_repair": True}])
++    def test_paid_repair_never_allowed(self, cfg):
++        assert paid_repair_allowed(cfg) is False
++
++    @pytest.mark.parametrize("session", [False, True])
++    @pytest.mark.parametrize("intent", [ClickIntent.PAID_REPAIR_CONFIRM, ClickIntent.UNKNOWN_DIALOG])
++    def test_blocked_intents_always_raise(self, intent, session):
++        with pytest.raises(PaidRepairBlocked):
++            check_click(intent, session)
++
++    @pytest.mark.parametrize("session", [False, True])
++    @pytest.mark.parametrize("target", [C.PAID_REPAIR_BUTTON, C.PAID_REPAIR_TEXT])
++    @pytest.mark.parametrize("intent", list(ClickIntent))
++    def test_paid_target_raises_for_every_intent(self, intent, target, session):
++        with pytest.raises(PaidRepairBlocked):
++            check_click(intent, session, target)
++
++    def test_generic_click_allowed_outside_session(self):
++        check_click(ClickIntent.GENERIC, False)  # cast / reel / store keep working
++
++    def test_generic_click_blocked_inside_session(self):
++        with pytest.raises(PaidRepairBlocked):
++            check_click(ClickIntent.GENERIC, True)
++
++    @pytest.mark.parametrize("intent", [ClickIntent.NAVIGATION, ClickIntent.TOOLS_TAB,
++                                         ClickIntent.FREE_REPAIR, ClickIntent.REPAIR_DONE])
++    def test_labelled_free_intents_allowed_in_session(self, intent):
++        check_click(intent, True, C.REPAIR_BUTTON)
++
++    @pytest.mark.parametrize("key", ["space", "enter", "Enter", "y", "return"])
++    def test_confirm_keys_blocked_in_session(self, key):
++        with pytest.raises(PaidRepairBlocked):
++            check_key(key, True)
++
++    @pytest.mark.parametrize("key", ["esc", "escape", "ESC", "back"])
++    def test_cancel_keys_allowed_in_session(self, key):
++        check_key(key, True)
++
++    def test_any_key_allowed_outside_session(self):
++        check_key("space", False)
++
++
++# ---------------------------------------------------------------- config
++class TestConfigDefaults:
++    def test_builtin_default_is_false(self):
++        assert DEFAULTS["allow_paid_repair"] is False
++
++    def test_load_config_without_file_defaults_false(self, tmp_path):
++        assert load_config(str(tmp_path / "missing.yaml"))["allow_paid_repair"] is False
++
++    def test_config_without_key_defaults_false(self, tmp_path):
++        p = tmp_path / "c.yaml"
++        p.write_text("backend: window\n")
++        assert load_config(str(p))["allow_paid_repair"] is False
++
++    def test_shipped_config_yaml_is_false(self):
++        with open(REPO_CONFIG, encoding="utf-8") as f:
++            assert yaml.safe_load(f)["allow_paid_repair"] is False
++        assert load_config(REPO_CONFIG)["allow_paid_repair"] is False
++
++    def test_true_is_honoured_as_a_value_but_warns(self, tmp_path, capsys):
++        p = tmp_path / "c.yaml"
++        p.write_text("allow_paid_repair: true\n")
++        cfg = load_config(str(p))
++        assert cfg["allow_paid_repair"] is True            # not silently rewritten
++        assert paid_repair_allowed(cfg) is False            # ...but grants nothing
++        assert "NO effect" in capsys.readouterr().err
++
++    def test_default_load_is_silent(self, tmp_path, capsys):
++        load_config(str(tmp_path / "missing.yaml"))
++        assert capsys.readouterr().err == ""
++
++    def test_evidence_defaults(self):
++        assert DEFAULTS["repair_min_confidence"] >= 0.5
++        assert DEFAULTS["repair_confirm_frames"] >= 2
